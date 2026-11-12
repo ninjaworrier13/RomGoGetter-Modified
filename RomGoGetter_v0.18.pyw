@@ -7706,6 +7706,7 @@ class App:
         tmp_path   = dest_path + '.part'
         bad_path   = dest_path + '.bad'
         resume_pos = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+        metadata_fname = os.path.basename(fname)
 
         # ── Local source file — copy directly ────────────────────────────────
         if url.startswith('local://'):
@@ -7745,16 +7746,16 @@ class App:
                         ok     = True
                         reason = 'name'
                     elif verify_mode == 'Size':
-                        exact_size = get_exact_size(fname, url, all_hashes, '')
+                        exact_size = get_exact_size(metadata_fname, url, all_hashes, '')
                         src_size   = os.path.getsize(src_path)
                         ok         = bool(exact_size) and src_size == exact_size
                         reason     = 'size ok' if ok else f'size mismatch ({src_size} != {exact_size})'
                     else:  # Hash or Overwrite — always hash-verify local copies
-                        expected = all_hashes.get(fname, {})
+                        expected = all_hashes.get(metadata_fname, {})
                         if expected:
                             ok, reason = verify_file(src_path, expected)
                         else:
-                            exact_size = get_exact_size(fname, url, all_hashes, '')
+                            exact_size = get_exact_size(metadata_fname, url, all_hashes, '')
                             if exact_size:
                                 src_size = os.path.getsize(src_path)
                                 ok       = src_size == exact_size
@@ -7832,7 +7833,7 @@ class App:
                 if cancel_event.is_set():
                     raise IOError("Stuck")
 
-                expected = all_hashes.get(fname, {})
+                expected = all_hashes.get(metadata_fname, {})
                 if expected:
                     ok, reason = verify_file(tmp_path, expected)
                     if not ok:
