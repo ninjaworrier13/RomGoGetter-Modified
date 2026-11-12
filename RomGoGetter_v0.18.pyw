@@ -5837,8 +5837,7 @@ class App:
                     # collapse same-named files from different subfolders.
                     merged = list(local_entries.values())
                     for e in file_entries:
-                        rel = (e[4] if len(e) > 4 and isinstance(e[4], str)
-                               else e[3] if len(e) > 3 and isinstance(e[3], str)
+                        rel = (e[3] if len(e) > 3 and isinstance(e[3], str)
                                else e[0]).replace('\\\\', '/')
                         if rel not in local_entries:
                             merged.append(e)
