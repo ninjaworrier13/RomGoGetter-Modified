@@ -1011,7 +1011,7 @@ def fetch_lolroms_filenames(url: str) -> tuple[list, str | None]:
             if href.startswith('//'):
                 href = 'https:' + href
 
-            target_url = urllib.parse.urljoin(root_base + '/', href)
+            target_url = urllib.parse.urljoin(page_url, href)
             target = urllib.parse.urlsplit(target_url)
             if target.netloc.lower() != root_host:
                 continue
@@ -6503,7 +6503,7 @@ class App:
                             # Restore dot if this file is selected
                             fname2, _ = self._all_tree_items.get(iid, ('', ''))
                             is_sel = any(
-                                d.get('selected') and d['selected'].get('filename') == fname2
+                                d.get('selected') and d['selected'].get('relative_path', d['selected'].get('filename')) == fname2
                                 for d in self.rom_dict.values())
                             vals[0] = '●' if is_sel else '○'
                             self.title_list.item(iid, values=vals, tags=(orig_tag,))
@@ -8933,13 +8933,15 @@ class App:
             _key, data = entry
             if select and not data.get('selected'):
                 inst = next((i for i in data.get('instances', [])
-                             if i['filename'] == fname), None)
+                             if i.get('relative_path', i['filename']) == fname
+                             or i['filename'] == fname), None)
                 if inst is None and data.get('instances'):
                     inst = select_best(data['instances']) or data['instances'][0]
                 if inst:
-                    data['selected'] = {'filename':   inst['filename'],
-                                        'size':       inst['size'],
-                                        'direct_url': inst.get('direct_url')}
+                    data['selected'] = {'filename': inst['filename'],
+                                        'size': inst['size'],
+                                        'direct_url': inst.get('direct_url'),
+                                        'relative_path': inst.get('relative_path', inst['filename'])}
                     vals[0] = '●'
                     self.compat_tree.item(iid, values=vals, tags=tags)
             elif not select and data.get('selected'):
@@ -8983,11 +8985,15 @@ class App:
                 if iid in visible:
                     if not data.get('selected'):
                         inst = next((i for i in data.get('instances', [])
-                                     if i['filename'] == fname), None)
+                                     if i.get('relative_path', i['filename']) == fname
+                                     or i['filename'] == fname), None)
+                        if inst is None and data.get('instances'):
+                            inst = select_best(data['instances']) or data['instances'][0]
                         if inst:
-                            data['selected'] = {'filename':   fname,
-                                                'size':       inst['size'],
-                                                'direct_url': inst.get('direct_url')}
+                            data['selected'] = {'filename': inst['filename'],
+                                                'size': inst['size'],
+                                                'direct_url': inst.get('direct_url'),
+                                                'relative_path': inst.get('relative_path', inst['filename'])}
                         else:
                             data['selected'] = {'filename': fname, 'size': size, 'direct_url': None}
                         vals[0] = '●'
@@ -9139,37 +9145,36 @@ class App:
         """Select or deselect all ROMs in a compatibility status group."""
         if not self._compat_all_iids:
             return
-        # Find all iids in this group
         group_iids = [iid for iid in self._compat_all_iids
                       if self.compat_tree.item(iid, 'tags') and
                       self.compat_tree.item(iid, 'tags')[0] in statuses]
         if not group_iids:
             return
-        # Check if any are currently selected (●)
         any_selected = any(
             self.compat_tree.item(iid, 'values')[0] == '●'
             for iid in group_iids)
-        # Toggle: if any selected → deselect all; if none selected → select all
         for iid in group_iids:
             vals = list(self.compat_tree.item(iid, 'values'))
-            fname = vals[1]
-            tags  = self.compat_tree.item(iid, 'tags')
+            row_key = vals[1]
+            tags = self.compat_tree.item(iid, 'tags')
+            data = self.rom_dict.get(row_key)
+            if not data:
+                continue
             if any_selected:
                 vals[0] = '○'
-                for title, data in self.rom_dict.items():
-                    if data.get('selected') and data['selected'].get('filename') == fname:
-                        data['selected'] = None
-                        break
+                if data.get('selected'):
+                    data['_prev_selected'] = dict(data['selected'])
+                    data['selected'] = None
             else:
                 vals[0] = '●'
-                for title, data in self.rom_dict.items():
-                    if data.get('selected') is None:
-                        for inst in data.get('instances', []):
-                            if inst.get('filename') == fname:
-                                data['selected'] = inst
-                                break
-                    if data.get('selected') and data['selected'].get('filename') == fname:
-                        break
+                if not data.get('selected') and data.get('instances'):
+                    inst = select_best(data['instances']) or data['instances'][0]
+                    data['selected'] = {
+                        'filename': inst['filename'],
+                        'size': inst['size'],
+                        'direct_url': inst.get('direct_url'),
+                        'relative_path': inst.get('relative_path', inst['filename']),
+                    }
             self.compat_tree.item(iid, values=vals, tags=tags)
         self._populate_compat_cards()
         self._populate_cards()
