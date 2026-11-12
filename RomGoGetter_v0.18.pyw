@@ -948,6 +948,10 @@ def fetch_lolroms_filenames(url: str) -> tuple[list, str | None]:
 
     root_base = 'https://lolroms.com'
     root_host = 'lolroms.com'
+    root_folder = posixpath.basename(root_path.rstrip('/'))
+    platform_root = root_folder.lower() in {
+        'nintendo', 'sony', 'sega', 'atari', 'snk', 'nec', 'microsoft',
+    }
     headers = {
         'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                            'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -1027,11 +1031,14 @@ def fetch_lolroms_filenames(url: str) -> tuple[list, str | None]:
                 relative_path = posixpath.normpath(posixpath.relpath(decoded_path, root_path))
                 if relative_path.startswith('../') or relative_path in ('.', '..'):
                     continue
+                group_scope = relative_path.split('/')[0] if platform_root else ''
+                if root_folder:
+                    relative_path = posixpath.join(root_folder, relative_path)
                 direct_url = urllib.parse.urlunsplit(
                     (target.scheme or 'https', target.netloc, target.path,
                      target.query, '')
                 )
-                results.append((leaf, '', direct_url, relative_path))
+                results.append((leaf, '', direct_url, relative_path, group_scope))
             elif not extension:
                 folder_url = urllib.parse.urlunsplit(
                     (target.scheme or 'https', target.netloc, target.path,
@@ -5375,10 +5382,9 @@ class App:
             filename   = entry[0]
             size_str   = entry[1]
             direct_url = entry[2] if len(entry) > 2 else None
-            relative_path = (entry[4] if len(entry) > 4 and isinstance(entry[4], str)
-                             else entry[3] if len(entry) > 3 and isinstance(entry[3], str)
-                             else filename)
-            relative_path = relative_path.replace('\\', '/')
+            relative_path = (entry[3] if len(entry) > 3 and isinstance(entry[3], str)
+                             else filename).replace('\\', '/')
+            group_scope = entry[4] if len(entry) > 4 and isinstance(entry[4], str) else ''
             parsed = parse_rom_filename(filename)
             if use_1g1r and parsed['attributes'] & EXCLUDE_ATTRIBUTES:
                 continue
@@ -5410,6 +5416,8 @@ class App:
                     r')', parsed['title']):
                 continue
             group_key = normalize_title(parsed['title'])
+            if group_scope:
+                group_key = f'{group_scope} / {group_key}'
             rom_dict[group_key].append({
                 'filename':   filename,
                 'size':       size_str,
@@ -5783,8 +5791,7 @@ class App:
                                 _dline_entries[_rel] = (_fname, _sz, None, _rel)
                     self._debug(f'Dir line {repr(_dline)}: {len(_dline_entries)} files, listdir={os.listdir(_dline)[:5]}')
                     existing_paths = {
-                        (e[4] if len(e) > 4 and isinstance(e[4], str)
-                         else e[3] if len(e) > 3 and isinstance(e[3], str)
+                        (e[3] if len(e) > 3 and isinstance(e[3], str)
                          else e[0]).replace('\\', '/')
                         for e in file_entries
                     }
@@ -5811,7 +5818,7 @@ class App:
                             fpath = os.path.join(local_source, fname)
                             if os.path.isfile(fpath):
                                 size_bytes = os.path.getsize(fpath)
-                                local_entries[fname] = (fname, format_size(size_bytes), None, True, fname)
+                                local_entries[fname] = (fname, format_size(size_bytes), None, fname)
                         # If no files found in the root, preserve relative paths
                         # while scanning subdirectories.
                         if not local_entries:
@@ -5823,7 +5830,7 @@ class App:
                                         continue
                                     size_bytes = os.path.getsize(fpath)
                                     rel = os.path.relpath(fpath, local_source).replace(os.sep, '/')
-                                    local_entries[rel] = (fname, format_size(size_bytes), None, True, rel)
+                                    local_entries[rel] = (fname, format_size(size_bytes), None, rel)
                         self._local_source_cache = (local_source, local_entries)
                         self._debug(f"Local source: {len(local_entries)} files found")
                     # Merge by relative path: local copy preferred, but do not
@@ -5843,8 +5850,7 @@ class App:
                 seen = set()
                 deduped = []
                 for e in file_entries:
-                    rel = (e[4] if len(e) > 4 and isinstance(e[4], str)
-                           else e[3] if len(e) > 3 and isinstance(e[3], str)
+                    rel = (e[3] if len(e) > 3 and isinstance(e[3], str)
                            else e[0]).replace('\\', '/')
                     if rel not in seen:
                         seen.add(rel)
@@ -6224,11 +6230,13 @@ class App:
                   command=self._export_dat).pack(side='left')
 
     def _fname_to_romdata(self):
-        """Return a dict mapping filename -> (rom_dict_key, data) for fast lookup."""
+        """Map each displayed file path (and unique basename) to its ROM data."""
         mapping = {}
         for key, data in self.rom_dict.items():
             for inst in data.get('instances', []):
-                mapping[inst['filename']] = (key, data)
+                identity = inst.get('relative_path', inst['filename'])
+                mapping[identity] = (key, data)
+                mapping.setdefault(inst['filename'], (key, data))
             if key not in mapping:
                 mapping[key] = (key, data)
         return mapping
@@ -6239,29 +6247,31 @@ class App:
             return
         fname_map = self._fname_to_romdata()
         for iid in list(self.title_list.get_children()):
-            fname, _tag = self._all_tree_items.get(iid, ('', ''))
-            if not fname:
+            row_key, _tag = self._all_tree_items.get(iid, ('', ''))
+            if not row_key:
                 continue
-            entry = fname_map.get(fname)
+            entry = fname_map.get(row_key)
             if entry is None:
                 continue
             _key, data = entry
-            try:
-                vals = list(self.title_list.item(iid, 'values'))
-            except Exception:
-                continue
-            if not vals:
-                continue
+            vals = list(self.title_list.item(iid, 'values'))
             size = vals[2] if len(vals) > 2 else ''
             if select:
-                inst = next((i for i in data.get('instances', []) if i['filename'] == fname), None)
-                data['selected'] = {'filename': fname, 'size': inst['size'] if inst else size, 'direct_url': inst.get('direct_url') if inst else None}
-                self.title_list.item(iid, values=('●', fname, size), tags=('selected',))
-                self._all_tree_items[iid] = (fname, 'selected')
+                inst = next((i for i in data.get('instances', [])
+                             if i.get('relative_path', i['filename']) == row_key
+                             or i['filename'] == row_key), None)
+                if inst:
+                    data['selected'] = {
+                        'filename': inst['filename'], 'size': inst['size'],
+                        'direct_url': inst.get('direct_url'),
+                        'relative_path': inst.get('relative_path', inst['filename']),
+                    }
+                self.title_list.item(iid, values=('●', row_key, size), tags=('selected',))
+                self._all_tree_items[iid] = (row_key, 'selected')
             else:
                 data['selected'] = None
-                self.title_list.item(iid, values=('○', fname, size), tags=('deselected',))
-                self._all_tree_items[iid] = (fname, 'deselected')
+                self.title_list.item(iid, values=('○', row_key, size), tags=('deselected',))
+                self._all_tree_items[iid] = (row_key, 'deselected')
         self._populate_cards()
         self._compat_prepopulate()
 
@@ -6271,96 +6281,96 @@ class App:
             return
         fname_map = self._fname_to_romdata()
         visible = set(self.title_list.get_children())
-        for iid, (fname, _tag) in list(self._all_tree_items.items()):
-            if not fname:
+        for iid, (row_key, _tag) in list(self._all_tree_items.items()):
+            if not row_key:
                 continue
-            entry = fname_map.get(fname)
+            entry = fname_map.get(row_key)
             if entry is None:
                 continue
             _key, data = entry
-            try:
-                vals = self.title_list.item(iid, 'values')
-            except Exception:
-                continue
+            vals = self.title_list.item(iid, 'values')
             if not vals:
                 continue
             size = vals[2] if len(vals) > 2 else '?'
             if iid in visible:
-                inst = next((i for i in data.get('instances', []) if i['filename'] == fname), None)
-                data['selected'] = {'filename': fname, 'size': inst['size'] if inst else size, 'direct_url': inst.get('direct_url') if inst else None}
-                self.title_list.item(iid, values=('●', fname, size), tags=('selected',))
-                self._all_tree_items[iid] = (fname, 'selected')
+                inst = next((i for i in data.get('instances', [])
+                             if i.get('relative_path', i['filename']) == row_key
+                             or i['filename'] == row_key), None)
+                if inst:
+                    data['selected'] = {
+                        'filename': inst['filename'], 'size': inst['size'],
+                        'direct_url': inst.get('direct_url'),
+                        'relative_path': inst.get('relative_path', inst['filename']),
+                    }
+                self.title_list.item(iid, values=('●', row_key, size), tags=('selected',))
+                self._all_tree_items[iid] = (row_key, 'selected')
             else:
                 data['selected'] = None
-                self.title_list.item(iid, values=('○', fname, size), tags=('deselected',))
-                self._all_tree_items[iid] = (fname, 'deselected')
+                self.title_list.item(iid, values=('○', row_key, size), tags=('deselected',))
+                self._all_tree_items[iid] = (row_key, 'deselected')
         self._populate_cards()
         self._compat_prepopulate()
 
     def _on_analysis_click(self, event):
-        """Toggle a file in/out of the download queue on double-click or space."""
-        # For keyboard events, use the current selection
+        """Toggle a file in/out of the download queue using its displayed path."""
         if event.type == tk.EventType.KeyPress:
             sel = self.title_list.selection()
             iid = sel[0] if sel else None
         else:
             region = self.title_list.identify_region(event.x, event.y)
-            iid    = self.title_list.identify_row(event.y)
+            iid = self.title_list.identify_row(event.y)
             if region != 'cell' or not iid:
                 return
         tags = self.title_list.item(iid, 'tags')
         if not tags:
             return
-        fname = self.title_list.set(iid, 'filename')
-        size  = self.title_list.set(iid, 'size')
+        row_key = self.title_list.set(iid, 'filename')
+        size = self.title_list.set(iid, 'size')
 
-        # Block missing Top N rows (not in collection, can't be downloaded)
         _, cur_tag = self._all_tree_items.get(iid, ('', ''))
         if cur_tag in ('nonenglish', 'topn_missing') and not any(
-                inst.get('filename') == fname
+                inst.get('relative_path', inst['filename']) == row_key
+                or inst.get('filename') == row_key
                 for d in self.rom_dict.values()
                 for inst in d.get('instances', [])):
             return
 
-        # Check actual queue state from rom_dict — don't trust the tag
         currently_selected = any(
-            d['selected'] and d['selected'].get('filename') == fname
+            d['selected'] and
+            d['selected'].get('relative_path', d['selected']['filename']) == row_key
             for d in self.rom_dict.values()
         )
 
         if currently_selected:
-            # Dequeue it
             for data in self.rom_dict.values():
-                if data['selected'] and data['selected'].get('filename') == fname:
+                if (data['selected'] and
+                        data['selected'].get('relative_path', data['selected']['filename']) == row_key):
                     data['_prev_selected'] = dict(data['selected'])
                     data['selected'] = None
                     break
-            self.title_list.item(iid, values=('○', fname, size), tags=('deselected',))
+            self.title_list.item(iid, values=('○', row_key, size), tags=('deselected',))
             if iid in self._all_tree_items:
-                self._all_tree_items[iid] = (fname, 'deselected')
+                self._all_tree_items[iid] = (row_key, 'deselected')
         else:
-            # Queue it — find the instance
             for data in self.rom_dict.values():
-                matched = False
-                for inst in data.get('instances', []):
-                    if inst['filename'] == fname:
-                        data['selected'] = {
-                            'filename':   fname,
-                            'size':       inst['size'],
-                            'direct_url': inst.get('direct_url'),
-                        }
-                        matched = True
-                        break
-                if not matched:
-                    prev = data.get('_prev_selected', {})
-                    if prev.get('filename') == fname:
-                        data['selected'] = prev
-                        matched = True
-                if matched:
+                inst = next((i for i in data.get('instances', [])
+                             if i.get('relative_path', i['filename']) == row_key
+                             or i['filename'] == row_key), None)
+                if inst:
+                    data['selected'] = {
+                        'filename': inst['filename'],
+                        'size': inst['size'],
+                        'direct_url': inst.get('direct_url'),
+                        'relative_path': inst.get('relative_path', inst['filename']),
+                    }
                     break
-            self.title_list.item(iid, values=('●', fname, size), tags=('selected',))
+                prev = data.get('_prev_selected', {})
+                if prev.get('relative_path', prev.get('filename')) == row_key:
+                    data['selected'] = prev
+                    break
+            self.title_list.item(iid, values=('●', row_key, size), tags=('selected',))
             if iid in self._all_tree_items:
-                self._all_tree_items[iid] = (fname, 'selected')
+                self._all_tree_items[iid] = (row_key, 'selected')
 
         self.summary['selected_titles'] = sum(
             1 for d in self.rom_dict.values() if d['selected'])
@@ -6368,7 +6378,7 @@ class App:
             parse_size_bytes(d['selected'].get('size', '0'))
             for d in self.rom_dict.values() if d['selected'])
         self.summary['selected_bytes'] = sel_bytes
-        self.summary['selected_size']  = format_size(sel_bytes)
+        self.summary['selected_size'] = format_size(sel_bytes)
         self._populate_cards()
         self._compat_prepopulate()
 
@@ -6694,7 +6704,7 @@ class App:
                     tag = 'topn_missing' if not data.get('instances') else 'nonenglish'
                     rows.append(('✗', data['_dat_fname'], '', tag))
                     continue
-                selected_fn   = data['selected']['filename'] if data['selected'] else None
+                selected_fn   = (data['selected'].get('relative_path', data['selected']['filename']) if data['selected'] else None)
                 non_english   = data.get('non_english', False)
                 is_translated = data.get('translated', False)
                 instances     = data.get('instances', [])
@@ -6703,8 +6713,9 @@ class App:
                         rows.append(('●', data['selected']['filename'],
                                      data['selected']['size'], 'selected'))
                     continue
-                for inst in sorted(instances, key=lambda i: i['filename']):
-                    fname  = inst['filename']
+                for inst in sorted(instances, key=lambda i: i.get('relative_path', i['filename'])):
+                    leaf_name = inst['filename']
+                    fname  = inst.get('relative_path', leaf_name)
                     size   = inst['size']
                     is_sel = fname == selected_fn
                     if is_sel:
@@ -7997,6 +8008,9 @@ class App:
                             _rel = os.path.relpath(_fpath, _dirpath).replace(os.sep, '/')
                             if _rel not in local_map and os.path.isfile(_fpath):
                                 local_map[_rel] = _fpath
+                            _prefixed_rel = posixpath.join(os.path.basename(os.path.normpath(_dirpath)), _rel)
+                            if _prefixed_rel not in local_map and os.path.isfile(_fpath):
+                                local_map[_prefixed_rel] = _fpath
                 else:
                     for _fname in os.listdir(_dirpath):
                         _fpath = os.path.join(_dirpath, _fname)
