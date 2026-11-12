@@ -7,6 +7,7 @@
 
 import sys
 import os
+import posixpath
 import hashlib
 import html
 import json
@@ -362,7 +363,8 @@ def select_best(instances: list) -> dict | None:
                 best = max(non_excl, key=rev_key)
             else:
                 return None
-    return {'filename': best['filename'], 'size': best['size']}
+    return {'filename': best['filename'], 'size': best['size'],
+            'relative_path': best.get('relative_path', best['filename'])}
 
 
 # ── DAT parsing ───────────────────────────────────────────────────────────────
@@ -925,16 +927,27 @@ def invalidate_url_cache(url: str = None):
 
 
 def fetch_lolroms_filenames(url: str) -> tuple[list, str | None]:
-    """Fetch file listing from a lolroms.com category page (direct or via Wayback).
-    Returns ([(filename, size_str, direct_download_url), ...], page_title | None).
-    The third element is the actual lolroms.com download URL regardless of how the
-    page was fetched — Wayback only archives HTML, not the files themselves.
-    """
-    # Strip fragment (#...) — urllib passes it through unlike browsers
-    url = url.split('#')[0].rstrip('/')
+    """Recursively fetch a LoLROMs category and all descendant folders.
 
+    Each result is (filename, size_str, direct_download_url, relative_path).
+    relative_path is rooted at the URL supplied by the user.
+    """
+    url = url.split('#')[0].rstrip('/')
     wayback = is_wayback_lolroms_url(url)
 
+    if wayback:
+        original = re.search(r'https?://lolroms\.com(?P<path>/[^?#]*)', url, re.IGNORECASE)
+        if not original:
+            raise ValueError(f"Cannot determine original LoLROMs path from: {url}")
+        root_path = unquote(original.group('path')).rstrip('/')
+    else:
+        root_parts = urllib.parse.urlsplit(url)
+        root_path = unquote(root_parts.path).rstrip('/')
+    if not root_path:
+        root_path = '/'
+
+    root_base = 'https://lolroms.com'
+    root_host = 'lolroms.com'
     headers = {
         'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                            'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -943,67 +956,90 @@ def fetch_lolroms_filenames(url: str) -> tuple[list, str | None]:
         'Accept-Language': 'en-US,en;q=0.9',
         'Referer':         'https://lolroms.com/',
     }
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        content = r.read().decode('utf-8', errors='replace')
+    file_extensions = {
+        '.7z', '.zip', '.rar', '.chd', '.iso', '.cue', '.bin', '.rom',
+        '.nes', '.sfc', '.smc', '.gba', '.gbc', '.gb', '.nds', '.3ds',
+        '.cia', '.nsp', '.xci',
+    }
 
-    # Page title from <h1> or derive from URL path
-    h1 = re.search(r'<h1[^>]*>(.*?)</h1>', content, re.IGNORECASE | re.DOTALL)
-    if h1:
-        page_title = re.sub(r'<[^>]+>', '', h1.group(1)).strip()
-    else:
-        # Derive from the lolroms path portion of the URL
-        lolroms_path = url[url.index('lolroms.com') + len('lolroms.com'):]
-        page_title   = html.unescape(unquote(lolroms_path.strip('/')))
-
-    
-    # Extract downloadable files from all page links.
-    # The current LoLROMs layout uses direct links rather than file-item list entries.
-
+    pending = [url]
+    visited = set()
     results = []
+    page_title = None
 
-    for a_match in re.finditer(
-        r'<a\b([^>]*)>(.*?)</a\s*>',
-        content,
-        re.DOTALL | re.IGNORECASE
-    ):
-        attrs, link_html = a_match.groups()
-
-        href_match = re.search(
-            r'\bhref=["\']([^"\']+)["\']',
-            attrs,
-            re.IGNORECASE
-        )
-        if not href_match:
+    while pending:
+        page_url = pending.pop(0).split('#')[0].rstrip('/')
+        if page_url in visited:
             continue
+        visited.add(page_url)
 
-        href = html.unescape(href_match.group(1)).split('#')[0]
+        req = urllib.request.Request(page_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            content = r.read().decode('utf-8', errors='replace')
 
-        # Ignore folders and links that are not downloadable files.
-        if not re.search(
-            r'\.(?:7z|zip|rar|chd|iso|cue|bin|rom|nes|sfc|smc|gba|gbc|gb|nds|3ds|cia|nsp|xci)(?:$|[?])',
-            href,
-            re.IGNORECASE
+        if page_title is None:
+            h1 = re.search(r'<h1[^>]*>(.*?)</h1>', content,
+                           re.IGNORECASE | re.DOTALL)
+            if h1:
+                page_title = re.sub(r'<[^>]+>', '', h1.group(1)).strip()
+            else:
+                page_title = html.unescape(unquote(root_path.strip('/')))
+
+        for a_match in re.finditer(
+            r'<a\b([^>]*)>(.*?)</a\s*>',
+            content,
+            re.DOTALL | re.IGNORECASE
         ):
-            continue
+            attrs, link_html = a_match.groups()
+            href_match = re.search(
+                r'\bhref=["\']([^"\']+)["\']',
+                attrs,
+                re.IGNORECASE
+            )
+            if not href_match:
+                continue
 
-        # Convert archived Wayback links back to original LoLROMs URLs.
-        if wayback and 'lolroms.com' in href:
-            href = href[href.index('lolroms.com') + len('lolroms.com'):]
+            href = html.unescape(href_match.group(1)).split('#')[0].strip()
+            if not href or href.startswith(('mailto:', 'javascript:')):
+                continue
+            if wayback and 'lolroms.com' in href.lower():
+                href = href[href.lower().index('lolroms.com') + len('lolroms.com'):]
+            if href.startswith('//'):
+                href = 'https:' + href
 
-        # Build the original download URL.
-        direct_url = urllib.parse.urljoin('https://lolroms.com/', href)
+            target_url = urllib.parse.urljoin(root_base + '/', href)
+            target = urllib.parse.urlsplit(target_url)
+            if target.netloc.lower() != root_host:
+                continue
 
-        # Get the filename from the actual download URL.
-        file_path = urllib.parse.urlsplit(direct_url).path
-        fname = html.unescape(unquote(file_path.split('/')[-1]))
+            decoded_path = unquote(target.path).rstrip('/')
+            if decoded_path == root_path:
+                continue
+            if not decoded_path.startswith(root_path.rstrip('/') + '/'):
+                continue
 
-        if fname:
-            results.append((fname, '', direct_url))
+            leaf = posixpath.basename(decoded_path)
+            if not leaf:
+                continue
+            extension = posixpath.splitext(leaf)[1].lower()
+
+            if extension in file_extensions:
+                relative_path = posixpath.normpath(posixpath.relpath(decoded_path, root_path))
+                if relative_path.startswith('../') or relative_path in ('.', '..'):
+                    continue
+                direct_url = urllib.parse.urlunsplit(
+                    (target.scheme or 'https', target.netloc, target.path,
+                     target.query, '')
+                )
+                results.append((leaf, '', direct_url, relative_path))
+            elif not extension:
+                folder_url = urllib.parse.urlunsplit(
+                    (target.scheme or 'https', target.netloc, target.path,
+                     target.query, '')
+                )
+                pending.append(folder_url)
 
     return results, page_title
-
-
 
 def get_remote_headers(url: str, headers: dict) -> dict:
     try:
@@ -5339,6 +5375,10 @@ class App:
             filename   = entry[0]
             size_str   = entry[1]
             direct_url = entry[2] if len(entry) > 2 else None
+            relative_path = (entry[4] if len(entry) > 4 and isinstance(entry[4], str)
+                             else entry[3] if len(entry) > 3 and isinstance(entry[3], str)
+                             else filename)
+            relative_path = relative_path.replace('\\', '/')
             parsed = parse_rom_filename(filename)
             if use_1g1r and parsed['attributes'] & EXCLUDE_ATTRIBUTES:
                 continue
@@ -5374,6 +5414,7 @@ class App:
                 'filename':   filename,
                 'size':       size_str,
                 'direct_url': direct_url,
+                'relative_path': relative_path,
                 'countries':  parsed['countries'],
                 'languages':  parsed['languages'],
                 'attributes': parsed['attributes'],
@@ -5410,7 +5451,7 @@ class App:
                 is_translated = False
                 if english_only and selected:
                     sel_inst = next(
-                        (i for i in instances if i['filename'] == selected['filename']), None)
+                        (i for i in instances if i.get('relative_path', i['filename']) == selected.get('relative_path', selected['filename'])), None)
                     if sel_inst:
                         has_en = ('En' in sel_inst['languages'] or
                                   bool(sel_inst['countries'] & ENGLISH_COUNTRIES))
@@ -5435,7 +5476,7 @@ class App:
                             excluded_bytes += parse_size_bytes(inst['size'])
                 if selected and not non_english:
                     for inst in instances:
-                        if inst['filename'] != selected['filename'] and not is_excluded(inst):
+                        if inst.get('relative_path', inst['filename']) != selected.get('relative_path', selected['filename']) and not is_excluded(inst):
                             unselected_other_bytes += parse_size_bytes(inst['size'])
                             unselected_other_count += 1
 
@@ -5446,7 +5487,8 @@ class App:
                         if inst['filename'] == selected['filename']:
                             sel_entry = {'filename': inst['filename'],
                                          'size':     inst['size'],
-                                         'direct_url': inst.get('direct_url')}
+                                         'direct_url': inst.get('direct_url'),
+                                         'relative_path': inst.get('relative_path', inst['filename'])}
                             break
                 # Exclude locally-owned files from all automatic mode selection
                 if sel_entry and self._is_locally_owned(sel_entry['filename']):
@@ -5470,11 +5512,12 @@ class App:
             else:
                 for inst in instances:
                     if not is_excluded(inst) and not self._is_locally_owned(inst['filename']):
-                        key = inst['filename']
+                        key = inst.get('relative_path', inst['filename'])
                         result[key] = {
                             'selected':    {'filename':   inst['filename'],
                                             'size':       inst['size'],
-                                            'direct_url': inst.get('direct_url')},
+                                            'direct_url': inst.get('direct_url'),
+                                            'relative_path': key},
                             'non_english': False,
                             'instances':   [inst],
                         }
@@ -5729,17 +5772,26 @@ class App:
                                 if not os.path.isfile(_fpath):
                                     continue
                                 _sz = format_size(os.path.getsize(_fpath))
-                                _dline_entries[_fname] = (_fname, _sz, None)
+                                _rel = os.path.relpath(_fpath, _dline).replace(os.sep, '/')
+                                _dline_entries[_rel] = (_fname, _sz, None, _rel)
                     else:
                         for _fname in os.listdir(_dline):
                             _fpath = os.path.join(_dline, _fname)
                             if os.path.isfile(_fpath):
                                 _sz = format_size(os.path.getsize(_fpath))
-                                _dline_entries[_fname] = (_fname, _sz, None)
+                                _rel = os.path.relpath(_fpath, _dline).replace(os.sep, '/')
+                                _dline_entries[_rel] = (_fname, _sz, None, _rel)
                     self._debug(f'Dir line {repr(_dline)}: {len(_dline_entries)} files, listdir={os.listdir(_dline)[:5]}')
-                    for _fname, _entry in _dline_entries.items():
-                        if not any(e[0] == _fname for e in file_entries):
+                    existing_paths = {
+                        (e[4] if len(e) > 4 and isinstance(e[4], str)
+                         else e[3] if len(e) > 3 and isinstance(e[3], str)
+                         else e[0]).replace('\\', '/')
+                        for e in file_entries
+                    }
+                    for _rel, _entry in _dline_entries.items():
+                        if _rel not in existing_paths:
                             file_entries.append(_entry)
+                            existing_paths.add(_rel)
 
                 # Store raw entries for live re-filtering on mode change
                 # ── Merge local source dir ───────────────────────────────────
@@ -5759,8 +5811,9 @@ class App:
                             fpath = os.path.join(local_source, fname)
                             if os.path.isfile(fpath):
                                 size_bytes = os.path.getsize(fpath)
-                                local_entries[fname] = (fname, format_size(size_bytes), None, True)
-                        # If no files found, scan subdirectories
+                                local_entries[fname] = (fname, format_size(size_bytes), None, True, fname)
+                        # If no files found in the root, preserve relative paths
+                        # while scanning subdirectories.
                         if not local_entries:
                             self._debug(f"No files in root, scanning subdirs of {local_source}")
                             for root, dirs, files in os.walk(local_source):
@@ -5769,29 +5822,35 @@ class App:
                                     if not os.path.isfile(fpath):
                                         continue
                                     size_bytes = os.path.getsize(fpath)
-                                    local_entries[fname] = (fname, format_size(size_bytes), None, True)
+                                    rel = os.path.relpath(fpath, local_source).replace(os.sep, '/')
+                                    local_entries[rel] = (fname, format_size(size_bytes), None, True, rel)
                         self._local_source_cache = (local_source, local_entries)
                         self._debug(f"Local source: {len(local_entries)} files found")
-                    # Merge: local preferred, then remote for anything not in local
-                    remote_by_name = {e[0]: e for e in file_entries}
-                    merged = []
-                    for fname, entry in local_entries.items():
-                        merged.append(entry[:3])  # (fname, size_str, None)
+                    # Merge by relative path: local copy preferred, but do not
+                    # collapse same-named files from different subfolders.
+                    merged = list(local_entries.values())
                     for e in file_entries:
-                        if e[0] not in local_entries:
+                        rel = (e[4] if len(e) > 4 and isinstance(e[4], str)
+                               else e[3] if len(e) > 3 and isinstance(e[3], str)
+                               else e[0]).replace('\\\\', '/')
+                        if rel not in local_entries:
                             merged.append(e)
                     self._debug(f"Merged: {len(local_entries)} local + {len(merged)-len(local_entries)} remote = {len(merged)} total")
                     file_entries = merged
 
-                # Deduplicate by filename — same file appearing in multiple URLs
+                # Deduplicate by relative path when available. Files with the
+                # same basename in different folders remain separate entries.
                 seen = set()
                 deduped = []
                 for e in file_entries:
-                    if e[0] not in seen:
-                        seen.add(e[0])
+                    rel = (e[4] if len(e) > 4 and isinstance(e[4], str)
+                           else e[3] if len(e) > 3 and isinstance(e[3], str)
+                           else e[0]).replace('\\', '/')
+                    if rel not in seen:
+                        seen.add(rel)
                         deduped.append(e)
                 if len(deduped) < len(file_entries):
-                    self._debug(f'Deduped {len(file_entries) - len(deduped)} duplicate filenames')
+                    self._debug(f'Deduped {len(file_entries) - len(deduped)} duplicate relative paths')
                 file_entries = deduped
 
                 # Strip non-game files globally before anything else sees them
@@ -7935,8 +7994,9 @@ class App:
                     for _root, _dirs, _files in os.walk(_dirpath):
                         for _fname in _files:
                             _fpath = os.path.join(_root, _fname)
-                            if _fname not in local_map and os.path.isfile(_fpath):
-                                local_map[_fname] = _fpath
+                            _rel = os.path.relpath(_fpath, _dirpath).replace(os.sep, '/')
+                            if _rel not in local_map and os.path.isfile(_fpath):
+                                local_map[_rel] = _fpath
                 else:
                     for _fname in os.listdir(_dirpath):
                         _fpath = os.path.join(_dirpath, _fname)
@@ -7947,20 +8007,24 @@ class App:
                 for data in self.rom_dict.values():
                     if data['selected']:
                         fname      = data['selected']['filename']
+                        file_key   = data['selected'].get('relative_path', fname).replace('\\', '/')
                         direct_url = data['selected'].get('direct_url')
-                        if fname not in url_map:
-                            if fname in local_map:
-                                url_map[fname] = f'local://{local_map[fname]}'
+                        if file_key not in url_map:
+                            if file_key in local_map:
+                                url_map[file_key] = f'local://{local_map[file_key]}'
+                            elif fname in local_map:
+                                url_map[file_key] = f'local://{local_map[fname]}'
                             elif direct_url:
-                                url_map[fname] = direct_url
+                                url_map[file_key] = direct_url
                             else:
-                                url_map[fname] = f"{base_url_stripped}/{quote(fname, safe='')}"
+                                url_map[file_key] = f"{base_url_stripped}/{quote(fname, safe='')}"
             # Files only in local_source (no URL source) also need entries
             for data in self.rom_dict.values():
                 if data['selected']:
                     fname = data['selected']['filename']
-                    if fname not in url_map and fname in local_map:
-                        url_map[fname] = f'local://{local_map[fname]}'
+                    file_key = data['selected'].get('relative_path', fname).replace('\\', '/')
+                    if file_key not in url_map and file_key in local_map:
+                        url_map[file_key] = f'local://{local_map[file_key]}'
 
             to_download = []
             to_skip     = []
@@ -7981,9 +8045,10 @@ class App:
             def check_file(data):
                 if not data['selected']:
                     return
-                fname     = data['selected']['filename']
+                filename  = data['selected']['filename']
+                fname     = data['selected'].get('relative_path', filename).replace('\\', '/')
                 size_str  = data['selected']['size']
-                dest_path = os.path.join(dest_dir, fname)
+                dest_path = os.path.join(dest_dir, *fname.split('/'))
                 bad_path  = dest_path + '.bad'
                 part_path = dest_path + '.part'
                 url       = url_map.get(fname)
@@ -8005,7 +8070,7 @@ class App:
                         to_download.append((fname, url, src_size))
                     return
 
-                size_b = get_exact_size(fname, url, all_hashes, size_str)
+                size_b = get_exact_size(filename, url, all_hashes, size_str)
 
                 # Overwrite — always re-download
                 if verify_mode == 'Overwrite':
@@ -8015,7 +8080,7 @@ class App:
 
                 # Check .bad file first — verify and recover if it passes
                 if not os.path.exists(dest_path) and os.path.exists(bad_path):
-                    expected = all_hashes.get(fname, {})
+                    expected = all_hashes.get(filename, {})
                     if expected:
                         ok, reason = verify_file(bad_path, expected)
                         if ok:
@@ -8074,7 +8139,7 @@ class App:
                     return
 
                 # Hash — full verification
-                expected = all_hashes.get(fname, {})
+                expected = all_hashes.get(filename, {})
                 if expected:
                     ok, reason = verify_file(dest_path, expected)
                     if ok:
@@ -8170,7 +8235,7 @@ class App:
             # Calculate skipped bytes from actual local file sizes
             skipped_bytes = 0
             for fname in to_skip:
-                local_path = os.path.join(dest_dir, fname)
+                local_path = os.path.join(dest_dir, *fname.split('/'))
                 if os.path.exists(local_path):
                     skipped_bytes += os.path.getsize(local_path)
 
@@ -8207,7 +8272,8 @@ class App:
             with ThreadPoolExecutor(max_workers=20) as executor:
 
                 def submit_slot(slot, fname, url, size):
-                    dest_path = os.path.join(dest_dir, fname)
+                    dest_path = os.path.join(dest_dir, *fname.split('/'))
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                     self.update_slot(slot, fname, 0, size or 1)
                     return executor.submit(
                         self._download_file, slot, fname, url, dest_path,
