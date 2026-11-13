@@ -7630,12 +7630,12 @@ class App:
             cutoff = now - 10
             self.dl_window = [(t, b) for t, b in self.dl_window if t >= cutoff]
 
-    def complete_slot(self, slot: int, nbytes: int, skipped=False, failed=False, fname=''):
+    def complete_slot(self, slot: int, nbytes: int, skipped=False, failed=False, fname='', count=True):
         with self.dl_lock:
             self.dl_slots.pop(slot, None)
             if skipped:
                 self.dl_skipped_files += 1
-            elif failed:
+            elif failed and count:
                 self.dl_failed_files += 1
             else:
                 self.dl_completed_files += 1
@@ -7702,7 +7702,7 @@ class App:
     def _download_file(self, slot, fname, url, dest_path, headers,
                        expected_size, etag_cache, cache_lock, cache_path,
                        max_retries, all_hashes, local_source='', verify_mode='Hash',
-                       size_cache=None, size_lock=None, dest_dir=''):
+                       size_cache=None, size_lock=None, dest_dir='', defer_failure=False):
         tmp_path   = dest_path + '.part'
         bad_path   = dest_path + '.bad'
         resume_pos = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
@@ -7713,7 +7713,7 @@ class App:
             src_path = url[len('local://'):]
             if not os.path.exists(src_path):
                 self.add_issue(f"[local missing] {fname}")
-                self.complete_slot(slot, 0, failed=True)
+                self.complete_slot(slot, 0, failed=True, count=not defer_failure)
                 return False, fname
             try:
                 src_size = os.path.getsize(src_path)
@@ -7723,7 +7723,7 @@ class App:
                 actual_size = os.path.getsize(dest_path)
                 if actual_size != src_size:
                     self.add_issue(f"[local copy fail] {fname}: size mismatch after copy")
-                    self.complete_slot(slot, 0, failed=True)
+                    self.complete_slot(slot, 0, failed=True, count=not defer_failure)
                     return False, fname
                 self.update_slot(slot, f"[copy] {fname}", src_size, src_size)
                 self._debug(f"[slot {slot}] local copy done: {fname}")
@@ -7732,7 +7732,7 @@ class App:
             except Exception as ex:
                 self._debug(f"[slot {slot}] local copy error: {ex}")
                 self.add_issue(f"[local copy fail] {fname}: {ex}")
-                self.complete_slot(slot, 0, failed=True)
+                self.complete_slot(slot, 0, failed=True, count=not defer_failure)
                 return False, fname
 
         # ── Check local source first ──────────────────────────────────────────
@@ -7867,7 +7867,7 @@ class App:
                 current_resp[0] = None
                 resume_pos = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
                 if attempt == max_retries:
-                    self.complete_slot(slot, 0, failed=True)
+                    self.complete_slot(slot, 0, failed=True, count=not defer_failure)
                     return False, fname
                 # Wait 5 s before retrying, but honour pause and stuck-cancel
                 for _ in range(10):
@@ -8277,6 +8277,8 @@ class App:
                 work_queue.put(item)
 
             active_slots = {}
+            retry_lookup = {item[0]: item for item in to_download}
+            failed_items = []
             mgr_lock     = threading.Lock()
             flags_lock   = threading.Lock()
             slot_flags   = {}   # slot -> 'ok' | 'last' | 'remove'
@@ -8293,7 +8295,7 @@ class App:
                         self._download_file, slot, fname, url, dest_path,
                         headers, size, etag_cache, cache_lock, cache_path,
                         max_ret, all_hashes, local_source, verify_mode,
-                        size_cache, size_lock, dest_dir,
+                        size_cache, size_lock, dest_dir, True,
                     )
 
                 def manager():
@@ -8333,7 +8335,9 @@ class App:
                                 except Exception:
                                     success, fn = False, ''
                                 if not success and fn:
-                                    self.add_issue(f"[failed] {fn}")
+                                    item = retry_lookup.get(fn)
+                                    if item:
+                                        failed_items.append(item)
                                 finished_count[0] += 1
                                 if draining:
                                     # Hide this bar and repack remaining to close gap
@@ -8396,16 +8400,61 @@ class App:
                                     except Exception:
                                         success, fn = False, ''
                                     if not success and fn:
-                                        self.add_issue(f"[failed] {fn}")
+                                        item = retry_lookup.get(fn)
+                                        if item:
+                                            failed_items.append(item)
                                     finished_count[0] += 1
                                     self.root.after(0, lambda s=slot:
                                         self.dl_slot_widgets[s]['frame'].pack_forget())
                         time.sleep(0.2)
 
-                threading.Thread(target=manager, daemon=True).start()
+                manager_thread = threading.Thread(target=manager, daemon=True)
+                manager_thread.start()
 
                 while finished_count[0] < total and self.dl_running:
                     time.sleep(0.5)
+                manager_thread.join()
+
+            # Retry every file that exhausted its normal retry count after
+            # the regular download queue has completely drained.
+            if failed_items and self.dl_running:
+                retry_total = len(failed_items)
+                self._debug(f"[final retry] starting second pass for {retry_total} failed file(s)")
+                self.root.after(0, lambda n=retry_total: self.dl_lbl_verify.config(
+                    text=f'Final retry pass: {n} file(s)', fg=YELLOW
+                ))
+
+                def retry_failed(item_index, item):
+                    fn, url, size = item
+                    slot = item_index % max(1, min(max_par, 20))
+                    dest_path = os.path.join(dest_dir, *fn.split('/'))
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    self.update_slot(slot, f'[final retry] {fn}', 0, size or 1)
+                    try:
+                        success, retry_name = self._download_file(
+                            slot, fn, url, dest_path, headers, size,
+                            etag_cache, cache_lock, cache_path, max_ret,
+                            all_hashes, local_source, verify_mode,
+                            size_cache, size_lock, dest_dir,
+                        )
+                        if not success and retry_name:
+                            self.add_issue(f"[failed] {retry_name} (final retry also failed)")
+                        return success, retry_name
+                    except Exception as ex:
+                        self._debug(f"[final retry] unexpected error for {fn}: {ex}")
+                        self.complete_slot(slot, 0, failed=True)
+                        self.add_issue(f"[failed] {fn} (final retry error: {ex})")
+                        return False, fn
+
+                with ThreadPoolExecutor(max_workers=max(1, min(max_par, 20))) as retry_executor:
+                    retry_futures = [
+                        retry_executor.submit(retry_failed, i, item)
+                        for i, item in enumerate(failed_items)
+                    ]
+                    for retry_future in as_completed(retry_futures):
+                        retry_future.result()
+
+                self._debug(f"[final retry] finished: {self.dl_failed_files} file(s) still failed")
 
             self.dl_running = False
             self.root.after(0, self._dl_done)
