@@ -7635,8 +7635,9 @@ class App:
             self.dl_slots.pop(slot, None)
             if skipped:
                 self.dl_skipped_files += 1
-            elif failed and count:
-                self.dl_failed_files += 1
+            elif failed:
+                if count:
+                    self.dl_failed_files += 1
             else:
                 self.dl_completed_files += 1
                 self.dl_completed_bytes += nbytes
