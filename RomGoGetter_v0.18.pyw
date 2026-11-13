@@ -7,6 +7,7 @@
 
 import sys
 import os
+import posixpath
 import hashlib
 import html
 import json
@@ -362,7 +363,8 @@ def select_best(instances: list) -> dict | None:
                 best = max(non_excl, key=rev_key)
             else:
                 return None
-    return {'filename': best['filename'], 'size': best['size']}
+    return {'filename': best['filename'], 'size': best['size'],
+            'relative_path': best.get('relative_path', best['filename'])}
 
 
 # ── DAT parsing ───────────────────────────────────────────────────────────────
@@ -925,16 +927,31 @@ def invalidate_url_cache(url: str = None):
 
 
 def fetch_lolroms_filenames(url: str) -> tuple[list, str | None]:
-    """Fetch file listing from a lolroms.com category page (direct or via Wayback).
-    Returns ([(filename, size_str, direct_download_url), ...], page_title | None).
-    The third element is the actual lolroms.com download URL regardless of how the
-    page was fetched — Wayback only archives HTML, not the files themselves.
-    """
-    # Strip fragment (#...) — urllib passes it through unlike browsers
-    url = url.split('#')[0].rstrip('/')
+    """Recursively fetch a LoLROMs category and all descendant folders.
 
+    Each result is (filename, size_str, direct_download_url, relative_path).
+    relative_path is rooted at the URL supplied by the user.
+    """
+    url = url.split('#')[0].rstrip('/')
     wayback = is_wayback_lolroms_url(url)
 
+    if wayback:
+        original = re.search(r'https?://lolroms\.com(?P<path>/[^?#]*)', url, re.IGNORECASE)
+        if not original:
+            raise ValueError(f"Cannot determine original LoLROMs path from: {url}")
+        root_path = unquote(original.group('path')).rstrip('/')
+    else:
+        root_parts = urllib.parse.urlsplit(url)
+        root_path = unquote(root_parts.path).rstrip('/')
+    if not root_path:
+        root_path = '/'
+
+    root_base = 'https://lolroms.com'
+    root_host = 'lolroms.com'
+    root_folder = posixpath.basename(root_path.rstrip('/'))
+    platform_root = root_folder.lower() in {
+        'nintendo', 'sony', 'sega', 'atari', 'snk', 'nec', 'microsoft',
+    }
     headers = {
         'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                            'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -943,67 +960,93 @@ def fetch_lolroms_filenames(url: str) -> tuple[list, str | None]:
         'Accept-Language': 'en-US,en;q=0.9',
         'Referer':         'https://lolroms.com/',
     }
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        content = r.read().decode('utf-8', errors='replace')
+    file_extensions = {
+        '.7z', '.zip', '.rar', '.chd', '.iso', '.cue', '.bin', '.rom',
+        '.nes', '.sfc', '.smc', '.gba', '.gbc', '.gb', '.nds', '.3ds',
+        '.cia', '.nsp', '.xci',
+    }
 
-    # Page title from <h1> or derive from URL path
-    h1 = re.search(r'<h1[^>]*>(.*?)</h1>', content, re.IGNORECASE | re.DOTALL)
-    if h1:
-        page_title = re.sub(r'<[^>]+>', '', h1.group(1)).strip()
-    else:
-        # Derive from the lolroms path portion of the URL
-        lolroms_path = url[url.index('lolroms.com') + len('lolroms.com'):]
-        page_title   = html.unescape(unquote(lolroms_path.strip('/')))
-
-    
-    # Extract downloadable files from all page links.
-    # The current LoLROMs layout uses direct links rather than file-item list entries.
-
+    pending = [url]
+    visited = set()
     results = []
+    page_title = None
 
-    for a_match in re.finditer(
-        r'<a\b([^>]*)>(.*?)</a\s*>',
-        content,
-        re.DOTALL | re.IGNORECASE
-    ):
-        attrs, link_html = a_match.groups()
-
-        href_match = re.search(
-            r'\bhref=["\']([^"\']+)["\']',
-            attrs,
-            re.IGNORECASE
-        )
-        if not href_match:
+    while pending:
+        page_url = pending.pop(0).split('#')[0].rstrip('/')
+        if page_url in visited:
             continue
+        visited.add(page_url)
 
-        href = html.unescape(href_match.group(1)).split('#')[0]
+        req = urllib.request.Request(page_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            content = r.read().decode('utf-8', errors='replace')
 
-        # Ignore folders and links that are not downloadable files.
-        if not re.search(
-            r'\.(?:7z|zip|rar|chd|iso|cue|bin|rom|nes|sfc|smc|gba|gbc|gb|nds|3ds|cia|nsp|xci)(?:$|[?])',
-            href,
-            re.IGNORECASE
+        if page_title is None:
+            h1 = re.search(r'<h1[^>]*>(.*?)</h1>', content,
+                           re.IGNORECASE | re.DOTALL)
+            if h1:
+                page_title = re.sub(r'<[^>]+>', '', h1.group(1)).strip()
+            else:
+                page_title = html.unescape(unquote(root_path.strip('/')))
+
+        for a_match in re.finditer(
+            r'<a\b([^>]*)>(.*?)</a\s*>',
+            content,
+            re.DOTALL | re.IGNORECASE
         ):
-            continue
+            attrs, link_html = a_match.groups()
+            href_match = re.search(
+                r'\bhref=["\']([^"\']+)["\']',
+                attrs,
+                re.IGNORECASE
+            )
+            if not href_match:
+                continue
 
-        # Convert archived Wayback links back to original LoLROMs URLs.
-        if wayback and 'lolroms.com' in href:
-            href = href[href.index('lolroms.com') + len('lolroms.com'):]
+            href = html.unescape(href_match.group(1)).split('#')[0].strip()
+            if not href or href.startswith(('mailto:', 'javascript:')):
+                continue
+            if wayback and 'lolroms.com' in href.lower():
+                href = href[href.lower().index('lolroms.com') + len('lolroms.com'):]
+            if href.startswith('//'):
+                href = 'https:' + href
 
-        # Build the original download URL.
-        direct_url = urllib.parse.urljoin('https://lolroms.com/', href)
+            target_url = urllib.parse.urljoin(page_url, href)
+            target = urllib.parse.urlsplit(target_url)
+            if target.netloc.lower() != root_host:
+                continue
 
-        # Get the filename from the actual download URL.
-        file_path = urllib.parse.urlsplit(direct_url).path
-        fname = html.unescape(unquote(file_path.split('/')[-1]))
+            decoded_path = unquote(target.path).rstrip('/')
+            if decoded_path == root_path:
+                continue
+            if not decoded_path.startswith(root_path.rstrip('/') + '/'):
+                continue
 
-        if fname:
-            results.append((fname, '', direct_url))
+            leaf = posixpath.basename(decoded_path)
+            if not leaf:
+                continue
+            extension = posixpath.splitext(leaf)[1].lower()
+
+            if extension in file_extensions:
+                relative_path = posixpath.normpath(posixpath.relpath(decoded_path, root_path))
+                if relative_path.startswith('../') or relative_path in ('.', '..'):
+                    continue
+                group_scope = relative_path.split('/')[0] if platform_root else ''
+                if root_folder:
+                    relative_path = posixpath.join(root_folder, relative_path)
+                direct_url = urllib.parse.urlunsplit(
+                    (target.scheme or 'https', target.netloc, target.path,
+                     target.query, '')
+                )
+                results.append((leaf, '', direct_url, relative_path, group_scope))
+            elif not extension:
+                folder_url = urllib.parse.urlunsplit(
+                    (target.scheme or 'https', target.netloc, target.path,
+                     target.query, '')
+                )
+                pending.append(folder_url)
 
     return results, page_title
-
-
 
 def get_remote_headers(url: str, headers: dict) -> dict:
     try:
@@ -5339,6 +5382,9 @@ class App:
             filename   = entry[0]
             size_str   = entry[1]
             direct_url = entry[2] if len(entry) > 2 else None
+            relative_path = (entry[3] if len(entry) > 3 and isinstance(entry[3], str)
+                             else filename).replace('\\', '/')
+            group_scope = entry[4] if len(entry) > 4 and isinstance(entry[4], str) else ''
             parsed = parse_rom_filename(filename)
             if use_1g1r and parsed['attributes'] & EXCLUDE_ATTRIBUTES:
                 continue
@@ -5370,10 +5416,13 @@ class App:
                     r')', parsed['title']):
                 continue
             group_key = normalize_title(parsed['title'])
+            if group_scope:
+                group_key = f'{group_scope} / {group_key}'
             rom_dict[group_key].append({
                 'filename':   filename,
                 'size':       size_str,
                 'direct_url': direct_url,
+                'relative_path': relative_path,
                 'countries':  parsed['countries'],
                 'languages':  parsed['languages'],
                 'attributes': parsed['attributes'],
@@ -5410,7 +5459,7 @@ class App:
                 is_translated = False
                 if english_only and selected:
                     sel_inst = next(
-                        (i for i in instances if i['filename'] == selected['filename']), None)
+                        (i for i in instances if i.get('relative_path', i['filename']) == selected.get('relative_path', selected['filename'])), None)
                     if sel_inst:
                         has_en = ('En' in sel_inst['languages'] or
                                   bool(sel_inst['countries'] & ENGLISH_COUNTRIES))
@@ -5435,7 +5484,7 @@ class App:
                             excluded_bytes += parse_size_bytes(inst['size'])
                 if selected and not non_english:
                     for inst in instances:
-                        if inst['filename'] != selected['filename'] and not is_excluded(inst):
+                        if inst.get('relative_path', inst['filename']) != selected.get('relative_path', selected['filename']) and not is_excluded(inst):
                             unselected_other_bytes += parse_size_bytes(inst['size'])
                             unselected_other_count += 1
 
@@ -5446,7 +5495,8 @@ class App:
                         if inst['filename'] == selected['filename']:
                             sel_entry = {'filename': inst['filename'],
                                          'size':     inst['size'],
-                                         'direct_url': inst.get('direct_url')}
+                                         'direct_url': inst.get('direct_url'),
+                                         'relative_path': inst.get('relative_path', inst['filename'])}
                             break
                 # Exclude locally-owned files from all automatic mode selection
                 if sel_entry and self._is_locally_owned(sel_entry['filename']):
@@ -5470,11 +5520,12 @@ class App:
             else:
                 for inst in instances:
                     if not is_excluded(inst) and not self._is_locally_owned(inst['filename']):
-                        key = inst['filename']
+                        key = inst.get('relative_path', inst['filename'])
                         result[key] = {
                             'selected':    {'filename':   inst['filename'],
                                             'size':       inst['size'],
-                                            'direct_url': inst.get('direct_url')},
+                                            'direct_url': inst.get('direct_url'),
+                                            'relative_path': key},
                             'non_english': False,
                             'instances':   [inst],
                         }
@@ -5729,17 +5780,25 @@ class App:
                                 if not os.path.isfile(_fpath):
                                     continue
                                 _sz = format_size(os.path.getsize(_fpath))
-                                _dline_entries[_fname] = (_fname, _sz, None)
+                                _rel = os.path.relpath(_fpath, _dline).replace(os.sep, '/')
+                                _dline_entries[_rel] = (_fname, _sz, None, _rel)
                     else:
                         for _fname in os.listdir(_dline):
                             _fpath = os.path.join(_dline, _fname)
                             if os.path.isfile(_fpath):
                                 _sz = format_size(os.path.getsize(_fpath))
-                                _dline_entries[_fname] = (_fname, _sz, None)
+                                _rel = os.path.relpath(_fpath, _dline).replace(os.sep, '/')
+                                _dline_entries[_rel] = (_fname, _sz, None, _rel)
                     self._debug(f'Dir line {repr(_dline)}: {len(_dline_entries)} files, listdir={os.listdir(_dline)[:5]}')
-                    for _fname, _entry in _dline_entries.items():
-                        if not any(e[0] == _fname for e in file_entries):
+                    existing_paths = {
+                        (e[3] if len(e) > 3 and isinstance(e[3], str)
+                         else e[0]).replace('\\', '/')
+                        for e in file_entries
+                    }
+                    for _rel, _entry in _dline_entries.items():
+                        if _rel not in existing_paths:
                             file_entries.append(_entry)
+                            existing_paths.add(_rel)
 
                 # Store raw entries for live re-filtering on mode change
                 # ── Merge local source dir ───────────────────────────────────
@@ -5759,8 +5818,9 @@ class App:
                             fpath = os.path.join(local_source, fname)
                             if os.path.isfile(fpath):
                                 size_bytes = os.path.getsize(fpath)
-                                local_entries[fname] = (fname, format_size(size_bytes), None, True)
-                        # If no files found, scan subdirectories
+                                local_entries[fname] = (fname, format_size(size_bytes), None, fname)
+                        # If no files found in the root, preserve relative paths
+                        # while scanning subdirectories.
                         if not local_entries:
                             self._debug(f"No files in root, scanning subdirs of {local_source}")
                             for root, dirs, files in os.walk(local_source):
@@ -5769,29 +5829,33 @@ class App:
                                     if not os.path.isfile(fpath):
                                         continue
                                     size_bytes = os.path.getsize(fpath)
-                                    local_entries[fname] = (fname, format_size(size_bytes), None, True)
+                                    rel = os.path.relpath(fpath, local_source).replace(os.sep, '/')
+                                    local_entries[rel] = (fname, format_size(size_bytes), None, rel)
                         self._local_source_cache = (local_source, local_entries)
                         self._debug(f"Local source: {len(local_entries)} files found")
-                    # Merge: local preferred, then remote for anything not in local
-                    remote_by_name = {e[0]: e for e in file_entries}
-                    merged = []
-                    for fname, entry in local_entries.items():
-                        merged.append(entry[:3])  # (fname, size_str, None)
+                    # Merge by relative path: local copy preferred, but do not
+                    # collapse same-named files from different subfolders.
+                    merged = list(local_entries.values())
                     for e in file_entries:
-                        if e[0] not in local_entries:
+                        rel = (e[3] if len(e) > 3 and isinstance(e[3], str)
+                               else e[0]).replace('\\\\', '/')
+                        if rel not in local_entries:
                             merged.append(e)
                     self._debug(f"Merged: {len(local_entries)} local + {len(merged)-len(local_entries)} remote = {len(merged)} total")
                     file_entries = merged
 
-                # Deduplicate by filename — same file appearing in multiple URLs
+                # Deduplicate by relative path when available. Files with the
+                # same basename in different folders remain separate entries.
                 seen = set()
                 deduped = []
                 for e in file_entries:
-                    if e[0] not in seen:
-                        seen.add(e[0])
+                    rel = (e[3] if len(e) > 3 and isinstance(e[3], str)
+                           else e[0]).replace('\\', '/')
+                    if rel not in seen:
+                        seen.add(rel)
                         deduped.append(e)
                 if len(deduped) < len(file_entries):
-                    self._debug(f'Deduped {len(file_entries) - len(deduped)} duplicate filenames')
+                    self._debug(f'Deduped {len(file_entries) - len(deduped)} duplicate relative paths')
                 file_entries = deduped
 
                 # Strip non-game files globally before anything else sees them
@@ -6165,11 +6229,13 @@ class App:
                   command=self._export_dat).pack(side='left')
 
     def _fname_to_romdata(self):
-        """Return a dict mapping filename -> (rom_dict_key, data) for fast lookup."""
+        """Map each displayed file path (and unique basename) to its ROM data."""
         mapping = {}
         for key, data in self.rom_dict.items():
             for inst in data.get('instances', []):
-                mapping[inst['filename']] = (key, data)
+                identity = inst.get('relative_path', inst['filename'])
+                mapping[identity] = (key, data)
+                mapping.setdefault(inst['filename'], (key, data))
             if key not in mapping:
                 mapping[key] = (key, data)
         return mapping
@@ -6180,29 +6246,31 @@ class App:
             return
         fname_map = self._fname_to_romdata()
         for iid in list(self.title_list.get_children()):
-            fname, _tag = self._all_tree_items.get(iid, ('', ''))
-            if not fname:
+            row_key, _tag = self._all_tree_items.get(iid, ('', ''))
+            if not row_key:
                 continue
-            entry = fname_map.get(fname)
+            entry = fname_map.get(row_key)
             if entry is None:
                 continue
             _key, data = entry
-            try:
-                vals = list(self.title_list.item(iid, 'values'))
-            except Exception:
-                continue
-            if not vals:
-                continue
+            vals = list(self.title_list.item(iid, 'values'))
             size = vals[2] if len(vals) > 2 else ''
             if select:
-                inst = next((i for i in data.get('instances', []) if i['filename'] == fname), None)
-                data['selected'] = {'filename': fname, 'size': inst['size'] if inst else size, 'direct_url': inst.get('direct_url') if inst else None}
-                self.title_list.item(iid, values=('●', fname, size), tags=('selected',))
-                self._all_tree_items[iid] = (fname, 'selected')
+                inst = next((i for i in data.get('instances', [])
+                             if i.get('relative_path', i['filename']) == row_key
+                             or i['filename'] == row_key), None)
+                if inst:
+                    data['selected'] = {
+                        'filename': inst['filename'], 'size': inst['size'],
+                        'direct_url': inst.get('direct_url'),
+                        'relative_path': inst.get('relative_path', inst['filename']),
+                    }
+                self.title_list.item(iid, values=('●', row_key, size), tags=('selected',))
+                self._all_tree_items[iid] = (row_key, 'selected')
             else:
                 data['selected'] = None
-                self.title_list.item(iid, values=('○', fname, size), tags=('deselected',))
-                self._all_tree_items[iid] = (fname, 'deselected')
+                self.title_list.item(iid, values=('○', row_key, size), tags=('deselected',))
+                self._all_tree_items[iid] = (row_key, 'deselected')
         self._populate_cards()
         self._compat_prepopulate()
 
@@ -6212,96 +6280,96 @@ class App:
             return
         fname_map = self._fname_to_romdata()
         visible = set(self.title_list.get_children())
-        for iid, (fname, _tag) in list(self._all_tree_items.items()):
-            if not fname:
+        for iid, (row_key, _tag) in list(self._all_tree_items.items()):
+            if not row_key:
                 continue
-            entry = fname_map.get(fname)
+            entry = fname_map.get(row_key)
             if entry is None:
                 continue
             _key, data = entry
-            try:
-                vals = self.title_list.item(iid, 'values')
-            except Exception:
-                continue
+            vals = self.title_list.item(iid, 'values')
             if not vals:
                 continue
             size = vals[2] if len(vals) > 2 else '?'
             if iid in visible:
-                inst = next((i for i in data.get('instances', []) if i['filename'] == fname), None)
-                data['selected'] = {'filename': fname, 'size': inst['size'] if inst else size, 'direct_url': inst.get('direct_url') if inst else None}
-                self.title_list.item(iid, values=('●', fname, size), tags=('selected',))
-                self._all_tree_items[iid] = (fname, 'selected')
+                inst = next((i for i in data.get('instances', [])
+                             if i.get('relative_path', i['filename']) == row_key
+                             or i['filename'] == row_key), None)
+                if inst:
+                    data['selected'] = {
+                        'filename': inst['filename'], 'size': inst['size'],
+                        'direct_url': inst.get('direct_url'),
+                        'relative_path': inst.get('relative_path', inst['filename']),
+                    }
+                self.title_list.item(iid, values=('●', row_key, size), tags=('selected',))
+                self._all_tree_items[iid] = (row_key, 'selected')
             else:
                 data['selected'] = None
-                self.title_list.item(iid, values=('○', fname, size), tags=('deselected',))
-                self._all_tree_items[iid] = (fname, 'deselected')
+                self.title_list.item(iid, values=('○', row_key, size), tags=('deselected',))
+                self._all_tree_items[iid] = (row_key, 'deselected')
         self._populate_cards()
         self._compat_prepopulate()
 
     def _on_analysis_click(self, event):
-        """Toggle a file in/out of the download queue on double-click or space."""
-        # For keyboard events, use the current selection
+        """Toggle a file in/out of the download queue using its displayed path."""
         if event.type == tk.EventType.KeyPress:
             sel = self.title_list.selection()
             iid = sel[0] if sel else None
         else:
             region = self.title_list.identify_region(event.x, event.y)
-            iid    = self.title_list.identify_row(event.y)
+            iid = self.title_list.identify_row(event.y)
             if region != 'cell' or not iid:
                 return
         tags = self.title_list.item(iid, 'tags')
         if not tags:
             return
-        fname = self.title_list.set(iid, 'filename')
-        size  = self.title_list.set(iid, 'size')
+        row_key = self.title_list.set(iid, 'filename')
+        size = self.title_list.set(iid, 'size')
 
-        # Block missing Top N rows (not in collection, can't be downloaded)
         _, cur_tag = self._all_tree_items.get(iid, ('', ''))
         if cur_tag in ('nonenglish', 'topn_missing') and not any(
-                inst.get('filename') == fname
+                inst.get('relative_path', inst['filename']) == row_key
+                or inst.get('filename') == row_key
                 for d in self.rom_dict.values()
                 for inst in d.get('instances', [])):
             return
 
-        # Check actual queue state from rom_dict — don't trust the tag
         currently_selected = any(
-            d['selected'] and d['selected'].get('filename') == fname
+            d['selected'] and
+            d['selected'].get('relative_path', d['selected']['filename']) == row_key
             for d in self.rom_dict.values()
         )
 
         if currently_selected:
-            # Dequeue it
             for data in self.rom_dict.values():
-                if data['selected'] and data['selected'].get('filename') == fname:
+                if (data['selected'] and
+                        data['selected'].get('relative_path', data['selected']['filename']) == row_key):
                     data['_prev_selected'] = dict(data['selected'])
                     data['selected'] = None
                     break
-            self.title_list.item(iid, values=('○', fname, size), tags=('deselected',))
+            self.title_list.item(iid, values=('○', row_key, size), tags=('deselected',))
             if iid in self._all_tree_items:
-                self._all_tree_items[iid] = (fname, 'deselected')
+                self._all_tree_items[iid] = (row_key, 'deselected')
         else:
-            # Queue it — find the instance
             for data in self.rom_dict.values():
-                matched = False
-                for inst in data.get('instances', []):
-                    if inst['filename'] == fname:
-                        data['selected'] = {
-                            'filename':   fname,
-                            'size':       inst['size'],
-                            'direct_url': inst.get('direct_url'),
-                        }
-                        matched = True
-                        break
-                if not matched:
-                    prev = data.get('_prev_selected', {})
-                    if prev.get('filename') == fname:
-                        data['selected'] = prev
-                        matched = True
-                if matched:
+                inst = next((i for i in data.get('instances', [])
+                             if i.get('relative_path', i['filename']) == row_key
+                             or i['filename'] == row_key), None)
+                if inst:
+                    data['selected'] = {
+                        'filename': inst['filename'],
+                        'size': inst['size'],
+                        'direct_url': inst.get('direct_url'),
+                        'relative_path': inst.get('relative_path', inst['filename']),
+                    }
                     break
-            self.title_list.item(iid, values=('●', fname, size), tags=('selected',))
+                prev = data.get('_prev_selected', {})
+                if prev.get('relative_path', prev.get('filename')) == row_key:
+                    data['selected'] = prev
+                    break
+            self.title_list.item(iid, values=('●', row_key, size), tags=('selected',))
             if iid in self._all_tree_items:
-                self._all_tree_items[iid] = (fname, 'selected')
+                self._all_tree_items[iid] = (row_key, 'selected')
 
         self.summary['selected_titles'] = sum(
             1 for d in self.rom_dict.values() if d['selected'])
@@ -6309,7 +6377,7 @@ class App:
             parse_size_bytes(d['selected'].get('size', '0'))
             for d in self.rom_dict.values() if d['selected'])
         self.summary['selected_bytes'] = sel_bytes
-        self.summary['selected_size']  = format_size(sel_bytes)
+        self.summary['selected_size'] = format_size(sel_bytes)
         self._populate_cards()
         self._compat_prepopulate()
 
@@ -6434,7 +6502,7 @@ class App:
                             # Restore dot if this file is selected
                             fname2, _ = self._all_tree_items.get(iid, ('', ''))
                             is_sel = any(
-                                d.get('selected') and d['selected'].get('filename') == fname2
+                                d.get('selected') and d['selected'].get('relative_path', d['selected'].get('filename')) == fname2
                                 for d in self.rom_dict.values())
                             vals[0] = '●' if is_sel else '○'
                             self.title_list.item(iid, values=vals, tags=(orig_tag,))
@@ -6635,7 +6703,7 @@ class App:
                     tag = 'topn_missing' if not data.get('instances') else 'nonenglish'
                     rows.append(('✗', data['_dat_fname'], '', tag))
                     continue
-                selected_fn   = data['selected']['filename'] if data['selected'] else None
+                selected_fn   = (data['selected'].get('relative_path', data['selected']['filename']) if data['selected'] else None)
                 non_english   = data.get('non_english', False)
                 is_translated = data.get('translated', False)
                 instances     = data.get('instances', [])
@@ -6644,8 +6712,9 @@ class App:
                         rows.append(('●', data['selected']['filename'],
                                      data['selected']['size'], 'selected'))
                     continue
-                for inst in sorted(instances, key=lambda i: i['filename']):
-                    fname  = inst['filename']
+                for inst in sorted(instances, key=lambda i: i.get('relative_path', i['filename'])):
+                    leaf_name = inst['filename']
+                    fname  = inst.get('relative_path', leaf_name)
                     size   = inst['size']
                     is_sel = fname == selected_fn
                     if is_sel:
@@ -7561,13 +7630,14 @@ class App:
             cutoff = now - 10
             self.dl_window = [(t, b) for t, b in self.dl_window if t >= cutoff]
 
-    def complete_slot(self, slot: int, nbytes: int, skipped=False, failed=False, fname=''):
+    def complete_slot(self, slot: int, nbytes: int, skipped=False, failed=False, fname='', count=True):
         with self.dl_lock:
             self.dl_slots.pop(slot, None)
             if skipped:
                 self.dl_skipped_files += 1
             elif failed:
-                self.dl_failed_files += 1
+                if count:
+                    self.dl_failed_files += 1
             else:
                 self.dl_completed_files += 1
                 self.dl_completed_bytes += nbytes
@@ -7633,17 +7703,18 @@ class App:
     def _download_file(self, slot, fname, url, dest_path, headers,
                        expected_size, etag_cache, cache_lock, cache_path,
                        max_retries, all_hashes, local_source='', verify_mode='Hash',
-                       size_cache=None, size_lock=None, dest_dir=''):
+                       size_cache=None, size_lock=None, dest_dir='', defer_failure=False):
         tmp_path   = dest_path + '.part'
         bad_path   = dest_path + '.bad'
         resume_pos = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+        metadata_fname = os.path.basename(fname)
 
         # ── Local source file — copy directly ────────────────────────────────
         if url.startswith('local://'):
             src_path = url[len('local://'):]
             if not os.path.exists(src_path):
                 self.add_issue(f"[local missing] {fname}")
-                self.complete_slot(slot, 0, failed=True)
+                self.complete_slot(slot, 0, failed=True, count=not defer_failure)
                 return False, fname
             try:
                 src_size = os.path.getsize(src_path)
@@ -7653,7 +7724,7 @@ class App:
                 actual_size = os.path.getsize(dest_path)
                 if actual_size != src_size:
                     self.add_issue(f"[local copy fail] {fname}: size mismatch after copy")
-                    self.complete_slot(slot, 0, failed=True)
+                    self.complete_slot(slot, 0, failed=True, count=not defer_failure)
                     return False, fname
                 self.update_slot(slot, f"[copy] {fname}", src_size, src_size)
                 self._debug(f"[slot {slot}] local copy done: {fname}")
@@ -7662,7 +7733,7 @@ class App:
             except Exception as ex:
                 self._debug(f"[slot {slot}] local copy error: {ex}")
                 self.add_issue(f"[local copy fail] {fname}: {ex}")
-                self.complete_slot(slot, 0, failed=True)
+                self.complete_slot(slot, 0, failed=True, count=not defer_failure)
                 return False, fname
 
         # ── Check local source first ──────────────────────────────────────────
@@ -7676,16 +7747,16 @@ class App:
                         ok     = True
                         reason = 'name'
                     elif verify_mode == 'Size':
-                        exact_size = get_exact_size(fname, url, all_hashes, '')
+                        exact_size = get_exact_size(metadata_fname, url, all_hashes, '')
                         src_size   = os.path.getsize(src_path)
                         ok         = bool(exact_size) and src_size == exact_size
                         reason     = 'size ok' if ok else f'size mismatch ({src_size} != {exact_size})'
                     else:  # Hash or Overwrite — always hash-verify local copies
-                        expected = all_hashes.get(fname, {})
+                        expected = all_hashes.get(metadata_fname, {})
                         if expected:
                             ok, reason = verify_file(src_path, expected)
                         else:
-                            exact_size = get_exact_size(fname, url, all_hashes, '')
+                            exact_size = get_exact_size(metadata_fname, url, all_hashes, '')
                             if exact_size:
                                 src_size = os.path.getsize(src_path)
                                 ok       = src_size == exact_size
@@ -7763,7 +7834,7 @@ class App:
                 if cancel_event.is_set():
                     raise IOError("Stuck")
 
-                expected = all_hashes.get(fname, {})
+                expected = all_hashes.get(metadata_fname, {})
                 if expected:
                     ok, reason = verify_file(tmp_path, expected)
                     if not ok:
@@ -7797,7 +7868,7 @@ class App:
                 current_resp[0] = None
                 resume_pos = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
                 if attempt == max_retries:
-                    self.complete_slot(slot, 0, failed=True)
+                    self.complete_slot(slot, 0, failed=True, count=not defer_failure)
                     return False, fname
                 # Wait 5 s before retrying, but honour pause and stuck-cancel
                 for _ in range(10):
@@ -7935,8 +8006,12 @@ class App:
                     for _root, _dirs, _files in os.walk(_dirpath):
                         for _fname in _files:
                             _fpath = os.path.join(_root, _fname)
-                            if _fname not in local_map and os.path.isfile(_fpath):
-                                local_map[_fname] = _fpath
+                            _rel = os.path.relpath(_fpath, _dirpath).replace(os.sep, '/')
+                            if _rel not in local_map and os.path.isfile(_fpath):
+                                local_map[_rel] = _fpath
+                            _prefixed_rel = posixpath.join(os.path.basename(os.path.normpath(_dirpath)), _rel)
+                            if _prefixed_rel not in local_map and os.path.isfile(_fpath):
+                                local_map[_prefixed_rel] = _fpath
                 else:
                     for _fname in os.listdir(_dirpath):
                         _fpath = os.path.join(_dirpath, _fname)
@@ -7947,20 +8022,24 @@ class App:
                 for data in self.rom_dict.values():
                     if data['selected']:
                         fname      = data['selected']['filename']
+                        file_key   = data['selected'].get('relative_path', fname).replace('\\', '/')
                         direct_url = data['selected'].get('direct_url')
-                        if fname not in url_map:
-                            if fname in local_map:
-                                url_map[fname] = f'local://{local_map[fname]}'
+                        if file_key not in url_map:
+                            if file_key in local_map:
+                                url_map[file_key] = f'local://{local_map[file_key]}'
+                            elif fname in local_map:
+                                url_map[file_key] = f'local://{local_map[fname]}'
                             elif direct_url:
-                                url_map[fname] = direct_url
+                                url_map[file_key] = direct_url
                             else:
-                                url_map[fname] = f"{base_url_stripped}/{quote(fname, safe='')}"
+                                url_map[file_key] = f"{base_url_stripped}/{quote(fname, safe='')}"
             # Files only in local_source (no URL source) also need entries
             for data in self.rom_dict.values():
                 if data['selected']:
                     fname = data['selected']['filename']
-                    if fname not in url_map and fname in local_map:
-                        url_map[fname] = f'local://{local_map[fname]}'
+                    file_key = data['selected'].get('relative_path', fname).replace('\\', '/')
+                    if file_key not in url_map and file_key in local_map:
+                        url_map[file_key] = f'local://{local_map[file_key]}'
 
             to_download = []
             to_skip     = []
@@ -7981,9 +8060,10 @@ class App:
             def check_file(data):
                 if not data['selected']:
                     return
-                fname     = data['selected']['filename']
+                filename  = data['selected']['filename']
+                fname     = data['selected'].get('relative_path', filename).replace('\\', '/')
                 size_str  = data['selected']['size']
-                dest_path = os.path.join(dest_dir, fname)
+                dest_path = os.path.join(dest_dir, *fname.split('/'))
                 bad_path  = dest_path + '.bad'
                 part_path = dest_path + '.part'
                 url       = url_map.get(fname)
@@ -8005,7 +8085,7 @@ class App:
                         to_download.append((fname, url, src_size))
                     return
 
-                size_b = get_exact_size(fname, url, all_hashes, size_str)
+                size_b = get_exact_size(filename, url, all_hashes, size_str)
 
                 # Overwrite — always re-download
                 if verify_mode == 'Overwrite':
@@ -8015,7 +8095,7 @@ class App:
 
                 # Check .bad file first — verify and recover if it passes
                 if not os.path.exists(dest_path) and os.path.exists(bad_path):
-                    expected = all_hashes.get(fname, {})
+                    expected = all_hashes.get(filename, {})
                     if expected:
                         ok, reason = verify_file(bad_path, expected)
                         if ok:
@@ -8074,7 +8154,7 @@ class App:
                     return
 
                 # Hash — full verification
-                expected = all_hashes.get(fname, {})
+                expected = all_hashes.get(filename, {})
                 if expected:
                     ok, reason = verify_file(dest_path, expected)
                     if ok:
@@ -8170,7 +8250,7 @@ class App:
             # Calculate skipped bytes from actual local file sizes
             skipped_bytes = 0
             for fname in to_skip:
-                local_path = os.path.join(dest_dir, fname)
+                local_path = os.path.join(dest_dir, *fname.split('/'))
                 if os.path.exists(local_path):
                     skipped_bytes += os.path.getsize(local_path)
 
@@ -8198,6 +8278,8 @@ class App:
                 work_queue.put(item)
 
             active_slots = {}
+            retry_lookup = {item[0]: item for item in to_download}
+            failed_items = []
             mgr_lock     = threading.Lock()
             flags_lock   = threading.Lock()
             slot_flags   = {}   # slot -> 'ok' | 'last' | 'remove'
@@ -8207,13 +8289,14 @@ class App:
             with ThreadPoolExecutor(max_workers=20) as executor:
 
                 def submit_slot(slot, fname, url, size):
-                    dest_path = os.path.join(dest_dir, fname)
+                    dest_path = os.path.join(dest_dir, *fname.split('/'))
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                     self.update_slot(slot, fname, 0, size or 1)
                     return executor.submit(
                         self._download_file, slot, fname, url, dest_path,
                         headers, size, etag_cache, cache_lock, cache_path,
                         max_ret, all_hashes, local_source, verify_mode,
-                        size_cache, size_lock, dest_dir,
+                        size_cache, size_lock, dest_dir, True,
                     )
 
                 def manager():
@@ -8253,7 +8336,9 @@ class App:
                                 except Exception:
                                     success, fn = False, ''
                                 if not success and fn:
-                                    self.add_issue(f"[failed] {fn}")
+                                    item = retry_lookup.get(fn)
+                                    if item:
+                                        failed_items.append(item)
                                 finished_count[0] += 1
                                 if draining:
                                     # Hide this bar and repack remaining to close gap
@@ -8316,16 +8401,69 @@ class App:
                                     except Exception:
                                         success, fn = False, ''
                                     if not success and fn:
-                                        self.add_issue(f"[failed] {fn}")
+                                        item = retry_lookup.get(fn)
+                                        if item:
+                                            failed_items.append(item)
                                     finished_count[0] += 1
                                     self.root.after(0, lambda s=slot:
                                         self.dl_slot_widgets[s]['frame'].pack_forget())
                         time.sleep(0.2)
 
-                threading.Thread(target=manager, daemon=True).start()
+                manager_thread = threading.Thread(target=manager, daemon=True)
+                manager_thread.start()
 
                 while finished_count[0] < total and self.dl_running:
                     time.sleep(0.5)
+                manager_thread.join()
+
+            # Retry every file that exhausted its normal retry count after
+            # the regular download queue has completely drained.
+            if failed_items and self.dl_running:
+                retry_total = len(failed_items)
+                self._debug(f"[final retry] starting second pass for {retry_total} failed file(s)")
+                self.root.after(0, lambda n=retry_total: self.dl_lbl_verify.config(
+                    text=f'Final retry pass: {n} file(s)', fg=YELLOW
+                ))
+
+                retry_queue = _queue.Queue()
+                for item in failed_items:
+                    retry_queue.put(item)
+
+                def retry_worker(slot):
+                    while self.dl_running:
+                        try:
+                            fn, url, size = retry_queue.get_nowait()
+                        except _queue.Empty:
+                            return
+                        try:
+                            dest_path = os.path.join(dest_dir, *fn.split('/'))
+                            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                            self.update_slot(slot, f'[final retry] {fn}', 0, size or 1)
+                            success, retry_name = self._download_file(
+                                slot, fn, url, dest_path, headers, size,
+                                etag_cache, cache_lock, cache_path, max_ret,
+                                all_hashes, local_source, verify_mode,
+                                size_cache, size_lock, dest_dir,
+                            )
+                            if not success and retry_name:
+                                self.add_issue(f"[failed] {retry_name} (final retry also failed)")
+                        except Exception as ex:
+                            self._debug(f"[final retry] unexpected error for {fn}: {ex}")
+                            self.complete_slot(slot, 0, failed=True)
+                            self.add_issue(f"[failed] {fn} (final retry error: {ex})")
+                        finally:
+                            retry_queue.task_done()
+
+                retry_workers = max(1, min(max_par, 20))
+                with ThreadPoolExecutor(max_workers=retry_workers) as retry_executor:
+                    retry_futures = [
+                        retry_executor.submit(retry_worker, slot)
+                        for slot in range(retry_workers)
+                    ]
+                    for retry_future in as_completed(retry_futures):
+                        retry_future.result()
+
+                self._debug(f"[final retry] finished: {self.dl_failed_files} file(s) still failed")
 
             self.dl_running = False
             self.root.after(0, self._dl_done)
@@ -8853,13 +8991,15 @@ class App:
             _key, data = entry
             if select and not data.get('selected'):
                 inst = next((i for i in data.get('instances', [])
-                             if i['filename'] == fname), None)
+                             if i.get('relative_path', i['filename']) == fname
+                             or i['filename'] == fname), None)
                 if inst is None and data.get('instances'):
                     inst = select_best(data['instances']) or data['instances'][0]
                 if inst:
-                    data['selected'] = {'filename':   inst['filename'],
-                                        'size':       inst['size'],
-                                        'direct_url': inst.get('direct_url')}
+                    data['selected'] = {'filename': inst['filename'],
+                                        'size': inst['size'],
+                                        'direct_url': inst.get('direct_url'),
+                                        'relative_path': inst.get('relative_path', inst['filename'])}
                     vals[0] = '●'
                     self.compat_tree.item(iid, values=vals, tags=tags)
             elif not select and data.get('selected'):
@@ -8903,11 +9043,15 @@ class App:
                 if iid in visible:
                     if not data.get('selected'):
                         inst = next((i for i in data.get('instances', [])
-                                     if i['filename'] == fname), None)
+                                     if i.get('relative_path', i['filename']) == fname
+                                     or i['filename'] == fname), None)
+                        if inst is None and data.get('instances'):
+                            inst = select_best(data['instances']) or data['instances'][0]
                         if inst:
-                            data['selected'] = {'filename':   fname,
-                                                'size':       inst['size'],
-                                                'direct_url': inst.get('direct_url')}
+                            data['selected'] = {'filename': inst['filename'],
+                                                'size': inst['size'],
+                                                'direct_url': inst.get('direct_url'),
+                                                'relative_path': inst.get('relative_path', inst['filename'])}
                         else:
                             data['selected'] = {'filename': fname, 'size': size, 'direct_url': None}
                         vals[0] = '●'
@@ -9059,37 +9203,36 @@ class App:
         """Select or deselect all ROMs in a compatibility status group."""
         if not self._compat_all_iids:
             return
-        # Find all iids in this group
         group_iids = [iid for iid in self._compat_all_iids
                       if self.compat_tree.item(iid, 'tags') and
                       self.compat_tree.item(iid, 'tags')[0] in statuses]
         if not group_iids:
             return
-        # Check if any are currently selected (●)
         any_selected = any(
             self.compat_tree.item(iid, 'values')[0] == '●'
             for iid in group_iids)
-        # Toggle: if any selected → deselect all; if none selected → select all
         for iid in group_iids:
             vals = list(self.compat_tree.item(iid, 'values'))
-            fname = vals[1]
-            tags  = self.compat_tree.item(iid, 'tags')
+            row_key = vals[1]
+            tags = self.compat_tree.item(iid, 'tags')
+            data = self.rom_dict.get(row_key)
+            if not data:
+                continue
             if any_selected:
                 vals[0] = '○'
-                for title, data in self.rom_dict.items():
-                    if data.get('selected') and data['selected'].get('filename') == fname:
-                        data['selected'] = None
-                        break
+                if data.get('selected'):
+                    data['_prev_selected'] = dict(data['selected'])
+                    data['selected'] = None
             else:
                 vals[0] = '●'
-                for title, data in self.rom_dict.items():
-                    if data.get('selected') is None:
-                        for inst in data.get('instances', []):
-                            if inst.get('filename') == fname:
-                                data['selected'] = inst
-                                break
-                    if data.get('selected') and data['selected'].get('filename') == fname:
-                        break
+                if not data.get('selected') and data.get('instances'):
+                    inst = select_best(data['instances']) or data['instances'][0]
+                    data['selected'] = {
+                        'filename': inst['filename'],
+                        'size': inst['size'],
+                        'direct_url': inst.get('direct_url'),
+                        'relative_path': inst.get('relative_path', inst['filename']),
+                    }
             self.compat_tree.item(iid, values=vals, tags=tags)
         self._populate_compat_cards()
         self._populate_cards()
