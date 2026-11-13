@@ -8424,32 +8424,40 @@ class App:
                     text=f'Final retry pass: {n} file(s)', fg=YELLOW
                 ))
 
-                def retry_failed(item_index, item):
-                    fn, url, size = item
-                    slot = item_index % max(1, min(max_par, 20))
-                    dest_path = os.path.join(dest_dir, *fn.split('/'))
-                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                    self.update_slot(slot, f'[final retry] {fn}', 0, size or 1)
-                    try:
-                        success, retry_name = self._download_file(
-                            slot, fn, url, dest_path, headers, size,
-                            etag_cache, cache_lock, cache_path, max_ret,
-                            all_hashes, local_source, verify_mode,
-                            size_cache, size_lock, dest_dir,
-                        )
-                        if not success and retry_name:
-                            self.add_issue(f"[failed] {retry_name} (final retry also failed)")
-                        return success, retry_name
-                    except Exception as ex:
-                        self._debug(f"[final retry] unexpected error for {fn}: {ex}")
-                        self.complete_slot(slot, 0, failed=True)
-                        self.add_issue(f"[failed] {fn} (final retry error: {ex})")
-                        return False, fn
+                retry_queue = _queue.Queue()
+                for item in failed_items:
+                    retry_queue.put(item)
 
-                with ThreadPoolExecutor(max_workers=max(1, min(max_par, 20))) as retry_executor:
+                def retry_worker(slot):
+                    while self.dl_running:
+                        try:
+                            fn, url, size = retry_queue.get_nowait()
+                        except _queue.Empty:
+                            return
+                        try:
+                            dest_path = os.path.join(dest_dir, *fn.split('/'))
+                            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                            self.update_slot(slot, f'[final retry] {fn}', 0, size or 1)
+                            success, retry_name = self._download_file(
+                                slot, fn, url, dest_path, headers, size,
+                                etag_cache, cache_lock, cache_path, max_ret,
+                                all_hashes, local_source, verify_mode,
+                                size_cache, size_lock, dest_dir,
+                            )
+                            if not success and retry_name:
+                                self.add_issue(f"[failed] {retry_name} (final retry also failed)")
+                        except Exception as ex:
+                            self._debug(f"[final retry] unexpected error for {fn}: {ex}")
+                            self.complete_slot(slot, 0, failed=True)
+                            self.add_issue(f"[failed] {fn} (final retry error: {ex})")
+                        finally:
+                            retry_queue.task_done()
+
+                retry_workers = max(1, min(max_par, 20))
+                with ThreadPoolExecutor(max_workers=retry_workers) as retry_executor:
                     retry_futures = [
-                        retry_executor.submit(retry_failed, i, item)
-                        for i, item in enumerate(failed_items)
+                        retry_executor.submit(retry_worker, slot)
+                        for slot in range(retry_workers)
                     ]
                     for retry_future in as_completed(retry_futures):
                         retry_future.result()
